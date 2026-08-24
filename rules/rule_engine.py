@@ -9,54 +9,26 @@ from typing import Any, Iterable
 from models.context_enriched_event import ContextEnrichedEvent
 from models.security_alert import SecurityAlert
 
-from .conditions import evaluate_condition
+from .conditions import evaluate_condition, get_nested_value
 from .rule_schema import RuleDefinition
 
 
 DEFAULT_RULES_PATH = (
-    Path(__file__).resolve().parent.parent / "rules_config" / "rules.json"
+    Path(__file__).resolve().parent.parent
+    / "rules_config"
+    / "rules.json"
 )
-
-
-def _to_datetime(value: str | datetime) -> datetime:
-    """
-    Convert an ISO timestamp into a timezone-aware datetime.
-    """
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        text = value.strip().replace("Z", "+00:00")
-        dt = datetime.fromisoformat(text)
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-
-    return dt
-
-
-def _get_nested_value(data: dict[str, Any], path: str) -> Any:
-    """
-    Local nested getter used for grouping.
-    """
-    current: Any = data
-
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-
-    return current
 
 
 class RuleEngine:
     """
-    Deterministic rule engine.
+    Deterministic Rule Engine for ContextEnrichedEvent objects.
 
     Supports:
     - single-event conditions
-    - thresholds
+    - threshold rules
     - time windows
-    - group_by
+    - group-by correlation
     - alert generation
     """
 
@@ -64,125 +36,101 @@ class RuleEngine:
         self,
         rules_path: str | Path | None = None,
     ) -> None:
-        self.rules_path = Path(rules_path or DEFAULT_RULES_PATH)
-        self.rules = self._load_rules()
+        self.rules_path = Path(
+            rules_path or DEFAULT_RULES_PATH
+        )
 
-    def _load_rules(self) -> list[RuleDefinition]:
+        self.rules: list[RuleDefinition] = []
+
+        self.load_rules()
+
+    # =========================================================
+    # RULE LOADING
+    # =========================================================
+
+    def load_rules(self) -> None:
+        """
+        Load and validate rules from rules.json.
+        """
+
         if not self.rules_path.exists():
             raise FileNotFoundError(
                 f"Rule configuration not found: {self.rules_path}"
             )
 
-        with self.rules_path.open("r", encoding="utf-8") as handle:
+        with self.rules_path.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
             raw_rules = json.load(handle)
 
-        return [RuleDefinition.model_validate(rule) for rule in raw_rules]
+        if not isinstance(raw_rules, list):
+            raise ValueError(
+                "rules.json must contain a JSON array."
+            )
+
+        self.rules = [
+            RuleDefinition.model_validate(rule)
+            for rule in raw_rules
+        ]
+
+    def reload_rules(self) -> None:
+        """
+        Reload rules without restarting the application.
+        """
+        self.load_rules()
+
+    # =========================================================
+    # SERIALIZATION HELPERS
+    # =========================================================
 
     @staticmethod
-    def _event_to_dict(event: ContextEnrichedEvent | dict[str, Any]) -> dict[str, Any]:
+    def _event_to_dict(
+        event: ContextEnrichedEvent | dict[str, Any],
+    ) -> dict[str, Any]:
         if isinstance(event, ContextEnrichedEvent):
             return event.model_dump()
+
         return event
 
-    def reload(self) -> None:
+    @staticmethod
+    def _parse_timestamp(
+        value: str | datetime,
+    ) -> datetime:
         """
-        Reload rules from disk without restarting the application.
+        Convert an ISO timestamp to timezone-aware datetime.
         """
-        self.rules = self._load_rules()
 
-    def evaluate_event(
-        self,
-        event: ContextEnrichedEvent | dict[str, Any],
-    ) -> list[SecurityAlert]:
-        """
-        Evaluate rules that operate on a single event.
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            timestamp = value.strip()
 
-        Threshold rules are intentionally handled by evaluate_events().
-        """
-        event_dict = self._event_to_dict(event)
-        alerts: list[SecurityAlert] = []
+            if timestamp.endswith("Z"):
+                timestamp = timestamp[:-1] + "+00:00"
 
-        for rule in self.rules:
-            if not rule.enabled:
-                continue
+            parsed = datetime.fromisoformat(timestamp)
 
-            # Threshold rules need a collection of events.
-            if rule.threshold is not None:
-                continue
-
-            if not self._conditions_match(rule, event_dict):
-                continue
-
-            if rule.action != "generate_alert":
-                continue
-
-            alerts.append(
-                self._build_alert(
-                    rule=rule,
-                    matched_events=[event_dict],
-                    triggered_conditions=self._build_triggered_conditions(
-                        rule, event_dict
-                    ),
-                )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
             )
 
-        return alerts
+        return parsed
 
-    def evaluate_events(
-        self,
-        events: Iterable[ContextEnrichedEvent | dict[str, Any]],
-    ) -> list[SecurityAlert]:
-        """
-        Evaluate a batch of context-enriched events.
-
-        This supports:
-        - ordinary single-event rules
-        - threshold rules
-        - time windows
-        - group_by
-        """
-        event_dicts = [self._event_to_dict(event) for event in events]
-
-        alerts: list[SecurityAlert] = []
-
-        for rule in self.rules:
-            if not rule.enabled:
-                continue
-
-            if rule.threshold is None:
-                for event_dict in event_dicts:
-                    if not self._conditions_match(rule, event_dict):
-                        continue
-
-                    if rule.action != "generate_alert":
-                        continue
-
-                    alerts.append(
-                        self._build_alert(
-                            rule=rule,
-                            matched_events=[event_dict],
-                            triggered_conditions=self._build_triggered_conditions(
-                                rule, event_dict
-                            ),
-                        )
-                    )
-
-                continue
-
-            alerts.extend(
-                self._evaluate_threshold_rule(
-                    rule=rule,
-                    events=event_dicts,
-                )
-            )
-
-        return alerts
+    # =========================================================
+    # CONDITION EVALUATION
+    # =========================================================
 
     @staticmethod
     def _conditions_match(
         rule: RuleDefinition,
         event: dict[str, Any],
     ) -> bool:
+        """
+        All conditions in a rule must match.
+        """
+
         if not rule.conditions:
             return True
 
@@ -196,32 +144,181 @@ class RuleEngine:
             for condition in rule.conditions
         )
 
+    # =========================================================
+    # CONDITION AUDIT INFORMATION
+    # =========================================================
+
     @staticmethod
-    def _build_triggered_conditions(
+    def _condition_results(
         rule: RuleDefinition,
         event: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        triggered: list[dict[str, Any]] = []
+        """
+        Record exactly how each condition evaluated.
+        """
+
+        results: list[dict[str, Any]] = []
 
         for condition in rule.conditions:
-            actual = _get_nested_value(event, condition.field)
+            actual = get_nested_value(
+                event,
+                condition.field,
+            )
 
-            triggered.append(
+            matched = evaluate_condition(
+                event=event,
+                field=condition.field,
+                operator=condition.operator,
+                expected=condition.value,
+            )
+
+            results.append(
                 {
                     "field": condition.field,
                     "operator": condition.operator,
                     "expected": condition.value,
                     "actual": actual,
-                    "matched": evaluate_condition(
-                        event=event,
-                        field=condition.field,
-                        operator=condition.operator,
-                        expected=condition.value,
-                    ),
+                    "matched": matched,
                 }
             )
 
-        return triggered
+        return results
+
+    # =========================================================
+    # SINGLE EVENT EVALUATION
+    # =========================================================
+
+    def evaluate_event(
+        self,
+        event: ContextEnrichedEvent | dict[str, Any],
+    ) -> list[SecurityAlert]:
+        """
+        Evaluate non-threshold rules against one event.
+
+        Threshold rules are handled by evaluate_events().
+        """
+
+        event_dict = self._event_to_dict(event)
+
+        alerts: list[SecurityAlert] = []
+
+        for rule in self.rules:
+            if not rule.enabled:
+                continue
+
+            # A threshold rule needs multiple events.
+            if rule.threshold is not None:
+                continue
+
+            if rule.action != "generate_alert":
+                continue
+
+            if not self._conditions_match(
+                rule,
+                event_dict,
+            ):
+                continue
+
+            alerts.append(
+                self._create_alert(
+                    rule=rule,
+                    matched_events=[event_dict],
+                    triggered_conditions=[
+                        {
+                            "type": "condition",
+                            "results": self._condition_results(
+                                rule,
+                                event_dict,
+                            ),
+                        }
+                    ],
+                )
+            )
+
+        return alerts
+
+    # =========================================================
+    # BATCH EVALUATION
+    # =========================================================
+
+    def evaluate_events(
+        self,
+        events: Iterable[
+            ContextEnrichedEvent | dict[str, Any]
+        ],
+    ) -> list[SecurityAlert]:
+        """
+        Evaluate a complete event collection.
+
+        This is the primary method for Part 2 because it supports:
+
+        - ordinary event rules
+        - threshold rules
+        - time windows
+        - grouping
+        """
+
+        event_dicts = [
+            self._event_to_dict(event)
+            for event in events
+        ]
+
+        alerts: list[SecurityAlert] = []
+
+        for rule in self.rules:
+            if not rule.enabled:
+                continue
+
+            if rule.action != "generate_alert":
+                continue
+
+            # -------------------------------------------------
+            # Ordinary single-event rule
+            # -------------------------------------------------
+
+            if rule.threshold is None:
+                for event_dict in event_dicts:
+
+                    if not self._conditions_match(
+                        rule,
+                        event_dict,
+                    ):
+                        continue
+
+                    alerts.append(
+                        self._create_alert(
+                            rule=rule,
+                            matched_events=[event_dict],
+                            triggered_conditions=[
+                                {
+                                    "type": "condition",
+                                    "results": self._condition_results(
+                                        rule,
+                                        event_dict,
+                                    ),
+                                }
+                            ],
+                        )
+                    )
+
+                continue
+
+            # -------------------------------------------------
+            # Threshold/time-window rule
+            # -------------------------------------------------
+
+            alerts.extend(
+                self._evaluate_threshold_rule(
+                    rule=rule,
+                    events=event_dicts,
+                )
+            )
+
+        return alerts
+
+    # =========================================================
+    # THRESHOLD RULE PROCESSING
+    # =========================================================
 
     def _evaluate_threshold_rule(
         self,
@@ -229,136 +326,228 @@ class RuleEngine:
         events: list[dict[str, Any]],
     ) -> list[SecurityAlert]:
         """
-        Threshold logic:
+        Evaluate a threshold rule.
 
         Example:
-        5 authentication failures
-        within 5 minutes
-        grouped by source IP
-        """
-        matching_events = [
-            event
-            for event in events
-            if self._conditions_match(rule, event)
-        ]
 
-        if not matching_events:
-            return []
+            5 failed authentications
+            within 5 minutes
+            grouped by source IP
+        """
 
         if rule.threshold is None:
             return []
 
-        group_by = rule.group_by
+        matching_events = [
+            event
+            for event in events
+            if self._conditions_match(
+                rule,
+                event,
+            )
+        ]
 
-        grouped: dict[Any, list[dict[str, Any]]] = {}
+        if len(matching_events) < rule.threshold:
+            return []
 
-        if group_by:
+        # -----------------------------------------------------
+        # Grouping
+        # -----------------------------------------------------
+
+        groups: dict[Any, list[dict[str, Any]]] = {}
+
+        if rule.group_by:
             for event in matching_events:
-                key = _get_nested_value(event, group_by)
 
-                # Keep missing grouping values separate rather than
-                # incorrectly merging unrelated events.
-                key = "__missing__" if key is None else key
+                group_value = get_nested_value(
+                    event,
+                    rule.group_by,
+                )
 
-                grouped.setdefault(key, []).append(event)
+                # Do not accidentally merge events
+                # where the grouping field is missing.
+                if group_value is None:
+                    group_value = "__missing__"
+
+                groups.setdefault(
+                    group_value,
+                    [],
+                ).append(event)
+
         else:
-            grouped["__all__"] = matching_events
+            groups["__all__"] = matching_events
 
         alerts: list[SecurityAlert] = []
 
-        for group_key, group_events in grouped.items():
+        # -----------------------------------------------------
+        # Evaluate every group
+        # -----------------------------------------------------
+
+        for group_value, group_events in groups.items():
+
             group_events.sort(
-                key=lambda event: _to_datetime(event["timestamp"])
+                key=lambda event: self._parse_timestamp(
+                    event["timestamp"]
+                )
             )
 
-            # Without a configured window, simply apply the threshold.
+            # -------------------------------------------------
+            # No time window
+            # -------------------------------------------------
+
             if rule.window_minutes is None:
+
                 if len(group_events) < rule.threshold:
                     continue
 
-                selected = group_events[-rule.threshold :]
+                selected_events = group_events[
+                    -rule.threshold:
+                ]
 
                 alerts.append(
-                    self._build_alert(
+                    self._create_alert(
                         rule=rule,
-                        matched_events=selected,
-                        triggered_conditions=self._build_threshold_conditions(
-                            rule,
-                            selected,
-                            group_key,
-                        ),
+                        matched_events=selected_events,
+                        triggered_conditions=[
+                            self._threshold_result(
+                                rule=rule,
+                                matched_events=selected_events,
+                                group_value=group_value,
+                            )
+                        ],
                     )
                 )
+
                 continue
 
-            window = timedelta(minutes=rule.window_minutes)
+            # -------------------------------------------------
+            # Sliding time window
+            # -------------------------------------------------
 
-            # Sliding-window evaluation.
-            for index, current_event in enumerate(group_events):
-                current_time = _to_datetime(current_event["timestamp"])
-                window_start = current_time - window
+            window = timedelta(
+                minutes=rule.window_minutes
+            )
+
+            alert_created = False
+
+            for index, current_event in enumerate(
+                group_events
+            ):
+                current_time = self._parse_timestamp(
+                    current_event["timestamp"]
+                )
+
+                window_start = (
+                    current_time - window
+                )
 
                 window_events = [
                     candidate
-                    for candidate in group_events[: index + 1]
-                    if window_start
-                    <= _to_datetime(candidate["timestamp"])
-                    <= current_time
+                    for candidate in group_events[
+                        : index + 1
+                    ]
+                    if (
+                        window_start
+                        <= self._parse_timestamp(
+                            candidate["timestamp"]
+                        )
+                        <= current_time
+                    )
                 ]
 
                 if len(window_events) < rule.threshold:
                     continue
 
-                selected = window_events[-rule.threshold :]
+                selected_events = window_events[
+                    -rule.threshold:
+                ]
 
                 alerts.append(
-                    self._build_alert(
+                    self._create_alert(
                         rule=rule,
-                        matched_events=selected,
-                        triggered_conditions=self._build_threshold_conditions(
-                            rule,
-                            selected,
-                            group_key,
-                        ),
+                        matched_events=selected_events,
+                        triggered_conditions=[
+                            self._threshold_result(
+                                rule=rule,
+                                matched_events=selected_events,
+                                group_value=group_value,
+                            )
+                        ],
                     )
                 )
 
-                # Only generate the first alert for this group/window.
-                break
+                # One alert per rule/group for this
+                # evaluation batch.
+                alert_created = True
+
+                if alert_created:
+                    break
 
         return alerts
 
-    @staticmethod
-    def _build_threshold_conditions(
-        rule: RuleDefinition,
-        events: list[dict[str, Any]],
-        group_key: Any,
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "threshold",
-                "threshold": rule.threshold,
-                "matched_count": len(events),
-                "window_minutes": rule.window_minutes,
-                "group_by": rule.group_by,
-                "group_value": group_key,
-                "conditions": [
-                    {
-                        "field": condition.field,
-                        "operator": condition.operator,
-                        "expected": condition.value,
-                    }
-                    for condition in rule.conditions
-                ],
-            }
-        ]
+    # =========================================================
+    # THRESHOLD AUDIT RESULT
+    # =========================================================
 
     @staticmethod
-    def _build_alert(
+    def _threshold_result(
+        rule: RuleDefinition,
+        matched_events: list[dict[str, Any]],
+        group_value: Any,
+    ) -> dict[str, Any]:
+        timestamps = [
+            event["timestamp"]
+            for event in matched_events
+            if event.get("timestamp") is not None
+        ]
+
+        return {
+            "type": "threshold",
+            "threshold": rule.threshold,
+            "matched_count": len(matched_events),
+            "window_minutes": rule.window_minutes,
+            "group_by": rule.group_by,
+            "group_value": group_value,
+            "first_event_timestamp": (
+                min(timestamps)
+                if timestamps
+                else None
+            ),
+            "last_event_timestamp": (
+                max(timestamps)
+                if timestamps
+                else None
+            ),
+            "conditions": [
+                {
+                    "field": condition.field,
+                    "operator": condition.operator,
+                    "expected": condition.value,
+                }
+                for condition in rule.conditions
+            ],
+        }
+
+    # =========================================================
+    # ALERT CREATION
+    # =========================================================
+
+    @staticmethod
+    def _create_alert(
         rule: RuleDefinition,
         matched_events: list[dict[str, Any]],
         triggered_conditions: list[dict[str, Any]],
     ) -> SecurityAlert:
+        """
+        Convert a successful rule evaluation
+        into the project's SecurityAlert model.
+        """
+
+        if not matched_events:
+            raise ValueError(
+                "Cannot create an alert without matched events."
+            )
+
         first_event = matched_events[0]
         last_event = matched_events[-1]
 
@@ -371,36 +560,72 @@ class RuleEngine:
         evidence: list[dict[str, Any]] = []
 
         for event in matched_events:
+            normalized = event.get(
+                "normalized_event",
+                {},
+            )
+
             evidence.append(
                 {
                     "type": "event",
-                    "event_id": event.get("event_id"),
-                    "timestamp": event.get("timestamp"),
-                    "event_type": event.get("normalized_event", {}).get(
+                    "event_id": event.get(
+                        "event_id"
+                    ),
+                    "timestamp": event.get(
+                        "timestamp"
+                    ),
+                    "event_type": normalized.get(
                         "event_type"
                     ),
-                    "message": event.get("normalized_event", {}).get(
+                    "severity": normalized.get(
+                        "severity"
+                    ),
+                    "message": normalized.get(
                         "message"
+                    ),
+                    "source_ip": (
+                        normalized
+                        .get("source", {})
+                        .get("ip")
+                    ),
+                    "destination_ip": (
+                        normalized
+                        .get("destination", {})
+                        .get("ip")
                     ),
                 }
             )
 
         return SecurityAlert(
-            alert_id=f"ALT-{uuid.uuid4().hex[:12].upper()}",
+            alert_id=(
+                f"ALT-"
+                f"{uuid.uuid4().hex[:12].upper()}"
+            ),
             event_ids=event_ids,
             rule_id=rule.rule_id,
             rule_name=rule.rule_name,
             severity=rule.severity,
             confidence=rule.confidence,
             mitre_attack=rule.mitre_attack,
-            entities=first_event.get("entities", {}),
-            asset_context=first_event.get("asset_context", {}),
-            threat_context=first_event.get("threat_context", {}),
+            entities=first_event.get(
+                "entities",
+                {},
+            ),
+            asset_context=first_event.get(
+                "asset_context",
+                {},
+            ),
+            threat_context=first_event.get(
+                "threat_context",
+                {},
+            ),
             evidence=evidence,
             triggered_conditions=triggered_conditions,
             timestamp=last_event.get(
                 "timestamp",
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
             ),
             status="new",
         )
