@@ -615,6 +615,10 @@ class RuleEngine:
                 "asset_context",
                 {},
             ),
+            user_context=first_event.get(
+                "user_context",
+                {},
+            ),
             threat_context=first_event.get(
                 "threat_context",
                 {},

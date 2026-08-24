@@ -1,132 +1,249 @@
-#risk_score =
-#   severity × severity_weight
-#  + confidence × confidence_weight
-#  + asset_criticality × asset_weight
-#  + user_privilege × privilege_weight
-#  + threat_context × threat_weight
-#  + mitre_context × mitre_weight
+# Deterministic weighted risk score.
+#
+# risk_score =
+#     severity           x severity_weight
+#   + confidence         x confidence_weight
+#   + asset_criticality  x asset_criticality_weight
+#   + user_privilege     x user_privilege_weight
+#   + threat_context     x threat_context_weight
+#   + mitre_context      x mitre_context_weight
+#
+# Every factor is normalized to [0,100] and the configured weights
+# are re-normalized to sum to 1.0, so the final score stays in
+# [0,100].
 
 from __future__ import annotations
 
 from typing import Any
 
-from .weights import DEFAULT_WEIGHTS, SEVERITY_WEIGHTS
+from .weights import (
+    CRITICALITY_SCORES,
+    DEFAULT_WEIGHTS,
+    NEUTRAL_EVIDENCE_SCORE,
+    PRIVILEGE_SCORES,
+    RISK_FACTORS,
+    SEVERITY_SCORES,
+    THREAT_CONFIDENCE_SCORES,
+)
 
 
-CRITICALITY_SCORES = {
-    "unknown": 0.0,
-    "low": 25.0,
-    "medium": 50.0,
-    "high": 75.0,
-    "critical": 100.0,
-}
+# Keys that may carry actual threat/IOC evidence on threat_context.
+THREAT_EVIDENCE_KEYS = (
+    "ioc_matches",
+    "iocs",
+    "matches",
+    "indicators",
+    "threat_matches",
+)
 
-PRIVILEGE_SCORES = {
-    "unknown": 0.0,
-    "none": 0.0,
-    "standard": 40.0,
-    "user": 40.0,
-    "high": 75.0,
-    "privileged": 90.0,
-    "root": 100.0,
-    "administrator": 90.0,
-}
+# Keys that may carry a MITRE technique or tactic mapping.
+MITRE_TECHNIQUE_KEYS = (
+    "techniques",
+    "technique_id",
+    "technique_name",
+    "technique",
+)
 
-THREAT_CONFIDENCE_SCORES = {
-    "unknown": 0.0,
-    "low": 25.0,
-    "medium": 50.0,
-    "high": 85.0,
-}
+MITRE_TACTIC_KEYS = (
+    "tactics",
+    "tactic_id",
+    "tactic_name",
+    "tactic",
+)
 
 
-def normalize_severity(value: str | None) -> float:
+def _clamp(value: float) -> float:
+    return max(0.0, min(float(value), 100.0))
+
+
+def _confidence_to_scale(value: Any) -> float | None:
     """
-    Convert rule severity into 0-100.
-    """
-    if not value:
-        return 0.0
+    Interpret a confidence-like value on the 0-100 scale.
 
-    raw = SEVERITY_WEIGHTS.get(value.lower(), 0)
-    return (raw / 50.0) * 100.0
+    Values in [0,1] are treated as fractions, values above 1 are
+    treated as already being on the 0-100 scale.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+
+    numeric = float(value)
+
+    if numeric <= 1.0:
+        return _clamp(numeric * 100.0)
+
+    return _clamp(numeric)
 
 
-def normalize_confidence(value: float | None) -> float:
+def normalize_severity(value: Any) -> float:
     """
-    Convert confidence in [0,1] to [0,100].
+    Map the project severity vocabulary (low/medium/high/critical)
+    to 0-100. Numeric severities are clamped into range.
     """
+
     if value is None:
         return 0.0
 
-    return max(0.0, min(float(value), 1.0)) * 100.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _clamp(float(value))
+
+    return SEVERITY_SCORES.get(str(value).strip().lower(), 0.0)
+
+
+def normalize_confidence(value: Any) -> float:
+    """
+    Convert a detection confidence in [0,1] to [0,100].
+    """
+
+    scaled = _confidence_to_scale(value)
+
+    return 0.0 if scaled is None else scaled
 
 
 def normalize_asset_criticality(value: Any) -> float:
     if value is None:
         return 0.0
 
-    key = str(value).strip().lower()
-    return CRITICALITY_SCORES.get(key, 0.0)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _clamp(float(value))
+
+    return CRITICALITY_SCORES.get(str(value).strip().lower(), 0.0)
 
 
 def normalize_user_privilege(value: Any) -> float:
     if value is None:
         return 0.0
 
-    key = str(value).strip().lower()
-    return PRIVILEGE_SCORES.get(key, 0.0)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _clamp(float(value))
+
+    return PRIVILEGE_SCORES.get(str(value).strip().lower(), 0.0)
+
+
+def _has_threat_evidence(threat_context: dict[str, Any]) -> bool:
+    """
+    Presence of threat_context alone is not evidence of a threat.
+    """
+
+    for key in THREAT_EVIDENCE_KEYS:
+        if threat_context.get(key):
+            return True
+
+    for key in ("is_malicious", "known_malicious", "threat_detected"):
+        if threat_context.get(key) is True:
+            return True
+
+    reputation = threat_context.get("reputation")
+
+    if isinstance(reputation, str) and reputation.strip().lower() in (
+        "malicious",
+        "suspicious",
+    ):
+        return True
+
+    return False
 
 
 def normalize_threat_context(
     threat_context: dict[str, Any] | None,
 ) -> float:
-    if not threat_context:
+    """
+    Score threat intelligence only when there is real evidence
+    (IOC matches, malicious reputation, ...). Missing or empty
+    threat context contributes 0 instead of a fabricated score.
+    """
+
+    if not isinstance(threat_context, dict) or not threat_context:
         return 0.0
 
-    ioc_matches = threat_context.get("ioc_matches") or []
+    if not _has_threat_evidence(threat_context):
+        return 0.0
 
-    if ioc_matches:
-        confidence = str(
-            threat_context.get("confidence", "medium")
-        ).lower()
+    confidence = threat_context.get("confidence")
 
-        if confidence in THREAT_CONFIDENCE_SCORES:
-            return THREAT_CONFIDENCE_SCORES[confidence]
+    if isinstance(confidence, str):
+        key = confidence.strip().lower()
 
-        numeric_confidence = threat_context.get("confidence")
+        if key in THREAT_CONFIDENCE_SCORES:
+            return THREAT_CONFIDENCE_SCORES[key]
 
-        if isinstance(numeric_confidence, (int, float)):
-            return normalize_confidence(float(numeric_confidence))
+    scaled = _confidence_to_scale(confidence)
 
-        return 50.0
+    if scaled is not None:
+        return scaled
 
-    return 0.0
+    return NEUTRAL_EVIDENCE_SCORE
+
+
+def _has_mitre_mapping(mitre_attack: dict[str, Any]) -> bool:
+    for key in MITRE_TECHNIQUE_KEYS + MITRE_TACTIC_KEYS:
+        if mitre_attack.get(key):
+            return True
+
+    return False
 
 
 def normalize_mitre_context(
     mitre_attack: dict[str, Any] | None,
 ) -> float:
-    if not mitre_attack:
+    """
+    A mapped technique/tactic produces a non-zero factor. The
+    existing MITRE mapping confidence is used when available.
+    """
+
+    if not isinstance(mitre_attack, dict) or not mitre_attack:
         return 0.0
 
-    techniques = mitre_attack.get("techniques") or []
-    tactics = mitre_attack.get("tactics") or []
-
-    if not techniques and not tactics:
+    if not _has_mitre_mapping(mitre_attack):
         return 0.0
 
-    confidence = mitre_attack.get("confidence")
+    scaled = _confidence_to_scale(
+        mitre_attack.get("confidence")
+    )
 
-    if isinstance(confidence, (int, float)):
-        return normalize_confidence(float(confidence))
+    if scaled is not None:
+        return scaled
 
-    return 50.0
+    return NEUTRAL_EVIDENCE_SCORE
+
+
+def normalize_weights(
+    weights: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """
+    Restrict weights to the known risk factors and re-normalize
+    them so that they sum to 1.0.
+    """
+
+    active_weights = dict(weights or DEFAULT_WEIGHTS)
+
+    resolved: dict[str, float] = {}
+
+    for factor in RISK_FACTORS:
+        try:
+            resolved[factor] = max(
+                0.0,
+                float(active_weights.get(factor, 0.0)),
+            )
+        except (TypeError, ValueError):
+            resolved[factor] = 0.0
+
+    total_weight = sum(resolved.values())
+
+    if total_weight <= 0:
+        resolved = dict(DEFAULT_WEIGHTS)
+        total_weight = sum(resolved.values())
+
+    return {
+        factor: value / total_weight
+        for factor, value in resolved.items()
+    }
 
 
 def calculate_risk_score(
     *,
-    severity: str,
-    confidence: float,
+    severity: Any,
+    confidence: Any,
     asset_criticality: Any,
     user_privilege: Any,
     threat_context: dict[str, Any] | None,
@@ -136,12 +253,13 @@ def calculate_risk_score(
     """
     Deterministic weighted risk calculation.
 
-    All factor values are normalized to [0,100].
+    Returns the final score in [0,100] and the individual factor
+    contributions used to produce it.
     """
 
-    active_weights = dict(weights or DEFAULT_WEIGHTS)
+    normalized_weights = normalize_weights(weights)
 
-    factor_values = {
+    factor_values: dict[str, float] = {
         "severity": normalize_severity(severity),
         "confidence": normalize_confidence(confidence),
         "asset_criticality": normalize_asset_criticality(
@@ -158,40 +276,26 @@ def calculate_risk_score(
         ),
     }
 
-    # Keep only configured factors.
-    total_weight = sum(
-        float(active_weights.get(key, 0.0))
-        for key in factor_values
-    )
-
-    if total_weight <= 0:
-        raise ValueError("Risk weights must contain a positive total weight.")
-
-    # Normalize weights in case the configuration does not sum exactly to 1.
-    normalized_weights = {
-        key: float(active_weights.get(key, 0.0)) / total_weight
-        for key in factor_values
-    }
-
     contributions: list[dict[str, Any]] = []
 
     score = 0.0
 
-    for factor_name, factor_value in factor_values.items():
-        weight = normalized_weights[factor_name]
+    for factor in RISK_FACTORS:
+        factor_value = factor_values[factor]
+        weight = normalized_weights[factor]
         contribution = factor_value * weight
 
         score += contribution
 
         contributions.append(
             {
-                "factor": factor_name,
+                "factor": factor,
                 "value": round(factor_value, 2),
                 "weight": round(weight, 4),
                 "contribution": round(contribution, 2),
             }
         )
 
-    score = round(max(0.0, min(score, 100.0)), 2)
+    score = round(_clamp(score), 2)
 
     return score, contributions
