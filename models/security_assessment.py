@@ -16,7 +16,6 @@ class RiskAssessment(BaseModel):
 
 class SecurityAssessment(BaseModel):
     alert: SecurityAlert
-
     risk: RiskAssessment
 
     evidence: list[dict[str, Any]] = Field(default_factory=list)
