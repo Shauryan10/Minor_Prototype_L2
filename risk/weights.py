@@ -1,15 +1,19 @@
-SEVERITY_WEIGHTS = {
-    "low": 10,
-    "medium": 25,
-    "high": 40,
-    "critical": 50,
+SEVERITY_WEIGHT = 0.35
+CONFIDENCE_WEIGHT = 0.20
+ASSET_CRITICALITY_WEIGHT = 0.20
+USER_PRIVILEGE_WEIGHT = 0.10
+THREAT_CONTEXT_WEIGHT = 0.10
+MITRE_CONTEXT_WEIGHT = 0.05
+
+SEVERITY_SCORES = {
+    "low": 25,
+    "medium": 50,
+    "high": 75,
+    "critical": 100,
 }
 
-DEFAULT_WEIGHTS = {
-    "severity": 0.35,
-    "confidence": 0.20,
-    "asset_criticality": 0.20,
-    "user_privilege": 0.10,
-    "threat_context": 0.10,
-    "mitre_context": 0.05,
+PRIVILEGE_SCORES = {
+    "none": 25,
+    "standard": 50,
+    "privileged": 100,
 }
