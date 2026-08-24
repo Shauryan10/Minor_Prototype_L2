@@ -18,6 +18,7 @@ class SecurityAlert(BaseModel):
     mitre_attack: dict[str, Any] = Field(default_factory=dict)
     entities: dict[str, Any] = Field(default_factory=dict)
     asset_context: dict[str, Any] = Field(default_factory=dict)
+    user_context: dict[str, Any] = Field(default_factory=dict)
     threat_context: dict[str, Any] = Field(default_factory=dict)
 
     evidence: list[dict[str, Any]] = Field(default_factory=list)
