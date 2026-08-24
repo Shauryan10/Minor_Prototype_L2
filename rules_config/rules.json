@@ -1,0 +1,59 @@
+[
+  {
+    "rule_id": "AUTH-001",
+    "rule_name": "Multiple Failed Authentication Attempts",
+    "description": "Detect repeated authentication failures.",
+    "conditions": [
+      {
+        "field": "normalized_event.event_type",
+        "operator": "equals",
+        "value": "authentication_failure"
+      }
+    ],
+    "severity": "high",
+    "confidence": 0.90,
+    "threshold": 5,
+    "window_minutes": 5,
+    "group_by": "normalized_event.source.ip",
+    "mitre_attack": {
+      "technique_id": "T1110",
+      "technique_name": "Brute Force"
+    },
+    "enabled": true,
+    "action": "generate_alert"
+  },
+  {
+    "rule_id": "ASSET-001",
+    "rule_name": "High Criticality Asset Activity",
+    "description": "Detect suspicious activity involving a critical asset.",
+    "conditions": [
+      {
+        "field": "asset_context.criticality",
+        "operator": "equals",
+        "value": "critical"
+      }
+    ],
+    "severity": "high",
+    "confidence": 0.85,
+    "mitre_attack": {},
+    "enabled": true,
+    "action": "generate_alert"
+  },
+  {
+    "rule_id": "PRIV-001",
+    "rule_name": "Privileged User Suspicious Activity",
+    "description": "Detect events involving privileged users.",
+    "conditions": [
+      {
+        "field": "user_context.privilege",
+        "operator": "equals",
+        "value": "privileged"
+      }
+    ],
+    "severity": "high",
+    "confidence": 0.85,
+    "mitre_attack": {},
+    "enabled": true,
+    "action": "generate_alert"
+  }
+]
